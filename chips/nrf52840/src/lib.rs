@@ -5,6 +5,7 @@ pub use nrf52::{
     pinmux, ppi, pwm, rtc, spi, temperature, timer, trng, uart, uicr, usbd,
 };
 pub mod chip;
+pub mod cryptocell;
 pub mod gpio;
 pub mod interrupt_service;
 

@@ -1,3 +1,4 @@
+use crate::cryptocell;
 use crate::gpio;
 use crate::peripheral_interrupts;
 use nrf52::interrupt_service::InterruptService;
@@ -18,6 +19,7 @@ impl InterruptService for Nrf52840InterruptService {
     unsafe fn service_interrupt(&self, interrupt: u32) -> bool {
         match interrupt {
             peripheral_interrupts::USBD => nrf52::usbd::USBD.handle_interrupt(),
+            peripheral_interrupts::CRYPTOCELL => cryptocell::CC310.handle_interrupt(),
             _ => return self.nrf52.service_interrupt(interrupt),
         }
         true
