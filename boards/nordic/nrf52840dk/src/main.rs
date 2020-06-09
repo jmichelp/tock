@@ -66,11 +66,20 @@
 #![cfg_attr(not(doc), no_main)]
 #![deny(missing_docs)]
 
+use capsules::analog_comparator;
+use capsules::virtual_alarm::VirtualMuxAlarm;
+use kernel::common::dynamic_deferred_call::{DynamicDeferredCall, DynamicDeferredCallClientState};
+
+use capsules::virtual_spi::MuxSpiMaster;
+use capsules::virtual_digest::VirtualMuxDigest;
+use capsules::virtual_hmac::VirtualMuxHmac;
+use kernel::capabilities;
 use kernel::component::Component;
+use kernel::hil;
+
 #[allow(unused_imports)]
-use kernel::{debug, debug_gpio, debug_verbose, static_init};
+use kernel::{create_capability, debug, debug_gpio, debug_verbose, static_init};
 use nrf52840::gpio::Pin;
-use nrf52dk_base::{SpiMX25R6435FPins, SpiPins, UartChannel, UartPins};
 
 // The nRF52840DK LEDs (see back of board)
 const LED1_PIN: Pin = Pin::P0_13;
@@ -104,7 +113,7 @@ pub mod io;
 // Whether to use UART debugging or Segger RTT (USB) debugging.
 // - Set to false to use UART.
 // - Set to true to use Segger RTT over USB.
-const USB_DEBUGGING: bool = false;
+const USB_DEBUGGING: bool = true;
 
 // State for loading and holding applications.
 // How should the kernel respond when a process faults.
@@ -114,7 +123,7 @@ const FAULT_RESPONSE: kernel::procs::FaultResponse = kernel::procs::FaultRespons
 const NUM_PROCS: usize = 8;
 
 #[link_section = ".app_memory"]
-static mut APP_MEMORY: [u8; 0x3C000] = [0; 0x3C000];
+static mut APP_MEMORY: [u8; 0x30000] = [0; 0x30000];
 
 static mut PROCESSES: [Option<&'static dyn kernel::procs::ProcessType>; NUM_PROCS] =
     [None, None, None, None, None, None, None, None];
@@ -126,27 +135,62 @@ static mut CHIP: Option<&'static nrf52840::chip::Chip> = None;
 #[link_section = ".stack_buffer"]
 pub static mut STACK_MEMORY: [u8; 0x1000] = [0; 0x1000];
 
+/// Supported drivers by the platform
+pub struct Platform {
+    button: &'static capsules::button::Button<'static>,
+    pconsole: &'static capsules::process_console::ProcessConsole<
+        'static,
+        components::process_console::Capability,
+    >,
+    console: &'static capsules::console::Console<'static>,
+    gpio: &'static capsules::gpio::GPIO<'static>,
+    led: &'static capsules::led::LED<'static>,
+    rng: &'static capsules::rng::RngDriver<'static>,
+    temp: &'static capsules::temperature::TemperatureSensor<'static>,
+    ipc: kernel::ipc::IPC,
+    analog_comparator:
+        &'static capsules::analog_comparator::AnalogComparator<'static, nrf52840::acomp::Comparator>,
+    alarm: &'static capsules::alarm::AlarmDriver<
+        'static,
+        capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52840::rtc::Rtc<'static>>,
+    >,
+    // The nRF52dk does not have the flash chip on it, so we make this optional.
+    nonvolatile_storage:
+        Option<&'static capsules::nonvolatile_storage_driver::NonvolatileStorage<'static>>,
+    digest: &'static capsules::digest::DigestDriver<'static, VirtualMuxDigest<'static, nrf52840::cryptocell::CryptoCell310<'static>, [u8; 32]>, [u8; 32]>,
+    hmac: &'static capsules::hmac::HmacDriver<'static, VirtualMuxHmac<'static, nrf52840::cryptocell::CryptoCell310<'static>, [u8; 32]>, [u8; 32]>,
+}
+
+impl kernel::Platform for Platform {
+    fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
+    where
+        F: FnOnce(Option<&dyn kernel::Driver>) -> R,
+    {
+        match driver_num {
+            capsules::console::DRIVER_NUM => f(Some(self.console)),
+            capsules::gpio::DRIVER_NUM => f(Some(self.gpio)),
+            capsules::alarm::DRIVER_NUM => f(Some(self.alarm)),
+            capsules::led::DRIVER_NUM => f(Some(self.led)),
+            capsules::button::DRIVER_NUM => f(Some(self.button)),
+            capsules::rng::DRIVER_NUM => f(Some(self.rng)),
+            capsules::temperature::DRIVER_NUM => f(Some(self.temp)),
+            capsules::analog_comparator::DRIVER_NUM => f(Some(self.analog_comparator)),
+            capsules::nonvolatile_storage_driver::DRIVER_NUM => {
+                f(self.nonvolatile_storage.map_or(None, |nv| Some(nv)))
+            }
+            capsules::hmac::DRIVER_NUM => f(Some(self.hmac)),
+            capsules::digest::DRIVER_NUM => f(Some(self.digest)),
+            kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
+            _ => f(None),
+        }
+    }
+}
+
 /// Entry point in the vector table called on hard reset.
 #[no_mangle]
 pub unsafe fn reset_handler() {
     // Loads relocations and clears BSS
     nrf52840::init();
-
-    let uart_channel = if USB_DEBUGGING {
-        // Initialize Segger RTT as early as possible so that any panic beyond this point can use the
-        // RTT memory object.
-        let mut rtt_memory_refs =
-            components::segger_rtt::SeggerRttMemoryComponent::new().finalize(());
-
-        // XXX: This is inherently unsafe as it aliases the mutable reference to rtt_memory. This
-        // aliases reference is only used inside a panic handler, which should be OK, but maybe we
-        // should use a const reference to rtt_memory and leverage interior mutability instead.
-        self::io::set_rtt_memory(&mut *rtt_memory_refs.get_rtt_memory_ptr());
-
-        UartChannel::Rtt(rtt_memory_refs)
-    } else {
-        UartChannel::Pins(UartPins::new(UART_RTS, UART_TXD, UART_CTS, UART_RXD))
-    };
 
     let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(&PROCESSES));
 
@@ -226,29 +270,306 @@ pub unsafe fn reset_handler() {
     let chip = static_init!(nrf52840::chip::Chip, nrf52840::chip::new());
     CHIP = Some(chip);
 
-    nrf52dk_base::setup_board(
+    let hmac_data_buffer = static_init!([u8; 64], [0; 64]);
+    let hmac_dest_buffer = static_init!([u8; 32], [0; 32]);
+    let mux_hmac = components::hmac::HmacMuxComponent::new(&nrf52840::cryptocell::CC310).finalize(
+        components::hmac_mux_component_helper!(nrf52840::cryptocell::CryptoCell310, [u8; 32]),
+    );
+    let hmac = components::hmac::HmacComponent::new(
         board_kernel,
-        BUTTON_RST_PIN,
-        &nrf52840::gpio::PORT,
-        gpio,
-        LED1_PIN,
-        LED2_PIN,
-        LED3_PIN,
-        led,
-        uart_channel,
-        &SpiPins::new(SPI_MOSI, SPI_MISO, SPI_CLK),
-        &Some(SpiMX25R6435FPins::new(
-            SPI_MX25R6435F_CHIP_SELECT,
-            SPI_MX25R6435F_WRITE_PROTECT_PIN,
-            SPI_MX25R6435F_HOLD_PIN,
-        )),
-        button,
-        true,
+        &mux_hmac,
+        hmac_data_buffer,
+        hmac_dest_buffer,
+    ).finalize(components::hmac_component_helper!(
+        nrf52840::cryptocell::CryptoCell310,
+        [u8; 32]
+    ));
+    let digest_data_buffer = static_init!([u8; 64], [0; 64]);
+    let digest_dest_buffer = static_init!([u8; 32], [0; 32]);
+    let mux_digest = components::digest::DigestMuxComponent::new(&nrf52840::cryptocell::CC310).finalize(
+        components::digest_mux_component_helper!(nrf52840::cryptocell::CryptoCell310, [u8; 32]),
+    );
+    let digest = components::digest::DigestComponent::new(
+        board_kernel,
+        &mux_digest,
+        digest_data_buffer,
+        digest_dest_buffer,
+    ).finalize(components::digest_component_helper!(
+        nrf52840::cryptocell::CryptoCell310,
+        [u8; 32]
+    ));
+
+    // Make non-volatile memory writable and activate the reset button
+    let uicr = nrf52840::uicr::Uicr::new();
+
+    // Check if we need to erase UICR memory to re-program it
+    // This only needs to be done when a bit needs to be flipped from 0 to 1.
+    let psel0_reset: u32 = uicr.get_psel0_reset_pin().map_or(0, |pin| pin as u32);
+    let psel1_reset: u32 = uicr.get_psel1_reset_pin().map_or(0, |pin| pin as u32);
+    let erase_uicr = ((!psel0_reset & (BUTTON_RST_PIN as u32))
+        | (!psel1_reset & (BUTTON_RST_PIN as u32))
+        | (!(uicr.get_vout() as u32) & (nrf52840::uicr::Regulator0Output::DEFAULT as u32)))
+        != 0;
+
+    if erase_uicr {
+        nrf52840::nvmc::NVMC.erase_uicr();
+    }
+
+    nrf52840::nvmc::NVMC.configure_writeable();
+    while !nrf52840::nvmc::NVMC.is_ready() {}
+
+    let mut needs_soft_reset: bool = false;
+
+    // Configure reset pins
+    if uicr
+        .get_psel0_reset_pin()
+        .map_or(true, |pin| pin != BUTTON_RST_PIN)
+    {
+        uicr.set_psel0_reset_pin(BUTTON_RST_PIN);
+        while !nrf52840::nvmc::NVMC.is_ready() {}
+        needs_soft_reset = true;
+    }
+    if uicr
+        .get_psel1_reset_pin()
+        .map_or(true, |pin| pin != BUTTON_RST_PIN)
+    {
+        uicr.set_psel1_reset_pin(BUTTON_RST_PIN);
+        while !nrf52840::nvmc::NVMC.is_ready() {}
+        needs_soft_reset = true;
+    }
+
+    // Configure voltage regulator output
+    if uicr.get_vout() != nrf52840::uicr::Regulator0Output::DEFAULT {
+        uicr.set_vout(nrf52840::uicr::Regulator0Output::DEFAULT);
+        while !nrf52840::nvmc::NVMC.is_ready() {}
+        needs_soft_reset = true;
+    }
+
+    // Any modification of UICR needs a soft reset for the changes to be taken into account.
+    if needs_soft_reset {
+        cortexm4::scb::reset();
+    }
+
+    // Create capabilities that the board needs to call certain protected kernel
+    // functions.
+    let process_management_capability =
+        create_capability!(capabilities::ProcessManagementCapability);
+    let main_loop_capability = create_capability!(capabilities::MainLoopCapability);
+    let memory_allocation_capability = create_capability!(capabilities::MemoryAllocationCapability);
+
+    // Configure kernel debug gpios as early as possible
+    kernel::debug::assign_gpios(
+        Some(&nrf52840::gpio::PORT[LED1_PIN]),
+        Some(&nrf52840::gpio::PORT[LED2_PIN]),
+        Some(&nrf52840::gpio::PORT[LED3_PIN]),
+    );
+
+    let rtc = &nrf52840::rtc::RTC;
+    rtc.start();
+    let mux_alarm = components::alarm::AlarmMuxComponent::new(rtc)
+        .finalize(components::alarm_mux_component_helper!(nrf52840::rtc::Rtc));
+    let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm)
+        .finalize(components::alarm_component_helper!(nrf52840::rtc::Rtc));
+
+    // Initialize Segger RTT as early as possible so that any panic beyond this point can use the
+    // RTT memory object.
+    let mut rtt_memory_refs =
+        components::segger_rtt::SeggerRttMemoryComponent::new().finalize(());
+
+    // XXX: This is inherently unsafe as it aliases the mutable reference to rtt_memory. This
+    // aliases reference is only used inside a panic handler, which should be OK, but maybe we
+    // should use a const reference to rtt_memory and leverage interior mutability instead.
+    self::io::set_rtt_memory(&mut *rtt_memory_refs.get_rtt_memory_ptr());
+
+    let rtt = components::segger_rtt::SeggerRttComponent::new(mux_alarm, rtt_memory_refs)
+            .finalize(components::segger_rtt_component_helper!(nrf52840::rtc::Rtc));
+
+    let dynamic_deferred_call_clients =
+        static_init!([DynamicDeferredCallClientState; 2], Default::default());
+    let dynamic_deferred_caller = static_init!(
+        DynamicDeferredCall,
+        DynamicDeferredCall::new(dynamic_deferred_call_clients)
+    );
+    DynamicDeferredCall::set_global_instance(dynamic_deferred_caller);
+
+    // Create a shared UART channel for the console and for kernel debug.
+    let uart_mux =
+        components::console::UartMuxComponent::new(rtt, 115200, dynamic_deferred_caller)
+            .finalize(());
+
+    let pconsole =
+        components::process_console::ProcessConsoleComponent::new(board_kernel, uart_mux)
+            .finalize(());
+
+    // Setup the console.
+    let console = components::console::ConsoleComponent::new(board_kernel, uart_mux).finalize(());
+    // Create the debugger object that handles calls to `debug!()`.
+    components::debug_writer::DebugWriterComponent::new(uart_mux).finalize(());
+
+    let temp = static_init!(
+        capsules::temperature::TemperatureSensor<'static>,
+        capsules::temperature::TemperatureSensor::new(
+            &nrf52840::temperature::TEMP,
+            board_kernel.create_grant(&memory_allocation_capability)
+        )
+    );
+    kernel::hil::sensors::TemperatureDriver::set_client(&nrf52840::temperature::TEMP, temp);
+
+    let rng = components::rng::RngComponent::new(board_kernel, &nrf52840::trng::TRNG).finalize(());
+
+    // SPI
+    let mux_spi = static_init!(
+        MuxSpiMaster<'static, nrf52840::spi::SPIM>,
+        MuxSpiMaster::new(&nrf52840::spi::SPIM0)
+    );
+    hil::spi::SpiMaster::set_client(&nrf52840::spi::SPIM0, mux_spi);
+    hil::spi::SpiMaster::init(&nrf52840::spi::SPIM0);
+    nrf52840::spi::SPIM0.configure(
+        nrf52840::pinmux::Pinmux::new(SPI_MOSI as u32),
+        nrf52840::pinmux::Pinmux::new(SPI_MISO as u32),
+        nrf52840::pinmux::Pinmux::new(SPI_CLK as u32),
+    );
+
+    let nonvolatile_storage: Option<
+        &'static capsules::nonvolatile_storage_driver::NonvolatileStorage<'static>,
+    > = {
+        // Create a SPI device for the mx25r6435f flash chip.
+        let mx25r6435f_spi = static_init!(
+            capsules::virtual_spi::VirtualSpiMasterDevice<'static, nrf52840::spi::SPIM>,
+            capsules::virtual_spi::VirtualSpiMasterDevice::new(
+                mux_spi,
+                &nrf52840::gpio::PORT[SPI_MX25R6435F_CHIP_SELECT]
+            )
+        );
+        // Create an alarm for this chip.
+        let mx25r6435f_virtual_alarm = static_init!(
+            VirtualMuxAlarm<'static, nrf52840::rtc::Rtc>,
+            VirtualMuxAlarm::new(mux_alarm)
+        );
+        // Setup the actual MX25R6435F driver.
+        let mx25r6435f = static_init!(
+            capsules::mx25r6435f::MX25R6435F<
+                'static,
+                capsules::virtual_spi::VirtualSpiMasterDevice<'static, nrf52840::spi::SPIM>,
+                nrf52840::gpio::GPIOPin,
+                VirtualMuxAlarm<'static, nrf52840::rtc::Rtc>,
+            >,
+            capsules::mx25r6435f::MX25R6435F::new(
+                mx25r6435f_spi,
+                mx25r6435f_virtual_alarm,
+                &mut capsules::mx25r6435f::TXBUFFER,
+                &mut capsules::mx25r6435f::RXBUFFER,
+                Some(&nrf52840::gpio::PORT[SPI_MX25R6435F_WRITE_PROTECT_PIN]),
+                Some(&nrf52840::gpio::PORT[SPI_MX25R6435F_HOLD_PIN])
+            )
+        );
+        mx25r6435f_spi.set_client(mx25r6435f);
+        hil::time::Alarm::set_client(mx25r6435f_virtual_alarm, mx25r6435f);
+
+        pub static mut FLASH_PAGEBUFFER: capsules::mx25r6435f::Mx25r6435fSector =
+            capsules::mx25r6435f::Mx25r6435fSector::new();
+        let nv_to_page = static_init!(
+            capsules::nonvolatile_to_pages::NonvolatileToPages<
+                'static,
+                capsules::mx25r6435f::MX25R6435F<
+                    'static,
+                    capsules::virtual_spi::VirtualSpiMasterDevice<'static, nrf52840::spi::SPIM>,
+                    nrf52840::gpio::GPIOPin,
+                    VirtualMuxAlarm<'static, nrf52840::rtc::Rtc>,
+                >,
+            >,
+            capsules::nonvolatile_to_pages::NonvolatileToPages::new(
+                mx25r6435f,
+                &mut FLASH_PAGEBUFFER
+            )
+        );
+        hil::flash::HasClient::set_client(mx25r6435f, nv_to_page);
+
+        let nonvolatile_storage = static_init!(
+            capsules::nonvolatile_storage_driver::NonvolatileStorage<'static>,
+            capsules::nonvolatile_storage_driver::NonvolatileStorage::new(
+                nv_to_page,
+                board_kernel.create_grant(&memory_allocation_capability),
+                0x60000, // Start address for userspace accessible region
+                0x20000, // Length of userspace accessible region
+                0,       // Start address of kernel accessible region
+                0x60000, // Length of kernel accessible region
+                &mut capsules::nonvolatile_storage_driver::BUFFER
+            )
+        );
+        hil::nonvolatile_storage::NonvolatileStorage::set_client(nv_to_page, nonvolatile_storage);
+        Some(nonvolatile_storage)
+    };
+
+    // Initialize AC using AIN5 (P0.29) as VIN+ and VIN- as AIN0 (P0.02)
+    // These are hardcoded pin assignments specified in the driver
+    let ac_channels = static_init!(
+        [&'static nrf52840::acomp::Channel; 1],
+        [&nrf52840::acomp::CHANNEL_AC0,]
+    );
+    let analog_comparator = static_init!(
+        analog_comparator::AnalogComparator<'static, nrf52840::acomp::Comparator>,
+        analog_comparator::AnalogComparator::new(&mut nrf52840::acomp::ACOMP, ac_channels)
+    );
+    nrf52840::acomp::ACOMP.set_client(analog_comparator);
+
+    // Start all of the clocks. Low power operation will require a better
+    // approach than this.
+    nrf52840::clock::CLOCK.low_stop();
+    nrf52840::clock::CLOCK.high_stop();
+
+    nrf52840::clock::CLOCK.low_set_source(nrf52840::clock::LowClockSource::XTAL);
+    nrf52840::clock::CLOCK.low_start();
+    nrf52840::clock::CLOCK.high_set_source(nrf52840::clock::HighClockSource::XTAL);
+    nrf52840::clock::CLOCK.high_start();
+    while !nrf52840::clock::CLOCK.low_started() {}
+    while !nrf52840::clock::CLOCK.high_started() {}
+
+    let platform = Platform {
+        button: button,
+        pconsole: pconsole,
+        console: console,
+        led: led,
+        gpio: gpio,
+        rng: rng,
+        temp: temp,
+        alarm: alarm,
+        analog_comparator: analog_comparator,
+        nonvolatile_storage: nonvolatile_storage,
+        ipc: kernel::ipc::IPC::new(board_kernel, &memory_allocation_capability),
+        digest: digest,
+        hmac: hmac,
+    };
+
+    platform.pconsole.start();
+    debug!("Initialization complete. Entering main loop\r");
+    debug!("{}", &nrf52840::ficr::FICR_INSTANCE);
+
+    extern "C" {
+        /// Beginning of the ROM region containing app images.
+        static _sapps: u8;
+
+        /// End of the ROM region containing app images.
+        ///
+        /// This symbol is defined in the linker script.
+        static _eapps: u8;
+    }
+    kernel::procs::load_processes(
+        board_kernel,
+        chip,
+        core::slice::from_raw_parts(
+            &_sapps as *const u8,
+            &_eapps as *const u8 as usize - &_sapps as *const u8 as usize,
+        ),
         &mut APP_MEMORY,
         &mut PROCESSES,
         FAULT_RESPONSE,
-        nrf52840::uicr::Regulator0Output::DEFAULT,
-        false,
-        chip,
-    );
+        &process_management_capability,
+    )
+    .unwrap_or_else(|err| {
+        debug!("Error loading processes!");
+        debug!("{:?}", err);
+    });
+
+    board_kernel.kernel_loop(&platform, chip, Some(&platform.ipc), &main_loop_capability);
 }

@@ -107,17 +107,17 @@ impl<'a, A: digest::Digest<'a, T>, T: DigestType> digest::Client<'a, T>
     }
 }
 
-impl<'a, A: digest::Digest<'a, T> + digest::HMACSha256, T: DigestType> digest::HMACSha256
+impl<'a, A: digest::Digest<'a, T> + digest::Sha256, T: DigestType> digest::Sha256
     for VirtualMuxDigest<'a, A, T>
 {
-    fn set_mode_hmacsha256(&self, key: &[u8; 32]) -> Result<(), ReturnCode> {
+    fn set_mode_sha256(&self) -> Result<(), ReturnCode> {
         // Check if any mux is enabled. If it isn't we enable it for us.
         if self.mux.running.get() == false {
             self.mux.running.set(true);
             self.mux.running_id.set(self.id);
-            self.mux.digest.set_mode_hmacsha256(key)
+            self.mux.digest.set_mode_sha256()
         } else if self.mux.running_id.get() == self.id {
-            self.mux.digest.set_mode_hmacsha256(key)
+            self.mux.digest.set_mode_sha256()
         } else {
             Err(ReturnCode::EBUSY)
         }

@@ -1,4 +1,5 @@
 #![no_std]
+#![feature(const_fn)]
 
 pub use nrf52::{
     acomp, adc, aes, ble_radio, clock, constants, crt1, ficr, i2c, ieee802154_radio, init, nvmc,

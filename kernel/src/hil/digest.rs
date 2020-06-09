@@ -7,6 +7,11 @@ use crate::returncode::ReturnCode;
 /// operations.
 pub trait DigestType: Eq + Copy + Clone + Sized + AsRef<[u8]> + AsMut<[u8]> {}
 
+// Used for MD5 hashes
+impl DigestType for [u8; 16] {}
+// Used for SHA1 hashes
+impl DigestType for [u8; 20] {}
+// Used for SHA224 and SHA256 hashes
 impl DigestType for [u8; 32] {}
 
 /// Implement this trait and use `set_client()` in order to receive callbacks.
@@ -62,6 +67,40 @@ pub trait Digest<'a, T: DigestType> {
     /// This won't clear the buffers provided to this API, that is up to the
     /// user to clear.
     fn clear_data(&self);
+}
+
+pub trait Md5 {
+    /// Call before `Digest::run()` to perform Md5
+    fn set_mode_md5(&self) -> Result<(), ReturnCode>;
+}
+
+pub trait Sha1 {
+    /// Call before `Digest::run()` to perform Sha1
+    fn set_mode_sha1(&self) -> Result<(), ReturnCode>;
+}
+
+pub trait Sha224 {
+    /// Call before `Digest::run()` to perform Sha224
+    fn set_mode_sha224(&self) -> Result<(), ReturnCode>;
+}
+
+pub trait Sha256 {
+    /// Call before `Digest::run()` to perform Sha256
+    fn set_mode_sha256(&self) -> Result<(), ReturnCode>;
+}
+
+pub trait HMACSha1 {
+    /// Call before `Digest::run()` to perform HMACSha1
+    ///
+    /// The key used for the HMAC is passed to this function.
+    fn set_mode_hmacsha1(&self, key: &[u8; 20]) -> Result<(), ReturnCode>;
+}
+
+pub trait HMACSha224 {
+    /// Call before `Digest::run()` to perform HMACSha224
+    ///
+    /// The key used for the HMAC is passed to this function.
+    fn set_mode_hmacsha224(&self, key: &[u8; 32]) -> Result<(), ReturnCode>;
 }
 
 pub trait HMACSha256 {
