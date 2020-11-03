@@ -228,12 +228,14 @@ impl Nvmc {
         self.registers.config.write(Configuration::WEN::Een);
     }
 
+    pub fn configure_read_only(&self) {
+        self.registers.config.write(Configuration::WEN::Ren);
+    }
+
     pub fn erase_uicr(&self) {
         self.registers.config.write(Configuration::WEN::Een);
         while !self.is_ready() {}
-        self.registers
-            .erasepage
-            .write(ErasePage::ERASEPAGE.val(0x10001000));
+        self.registers.eraseuicr.write(EraseUicr::ERASEUICR::ERASE);
         while !self.is_ready() {}
     }
 

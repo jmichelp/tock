@@ -46,12 +46,19 @@ impl Component for NrfStartupComponent {
             erase_uicr |= !uicr.is_nfc_pins_protection_enabled();
         }
 
+        // Save the values used by bootloader to restore them in case we need to erase
+        let bootloader_infos = uicr.get_bootloader_infos();
         if erase_uicr {
             nrf52::nvmc::NVMC.erase_uicr();
         }
 
         nrf52::nvmc::NVMC.configure_writeable();
         while !nrf52::nvmc::NVMC.is_ready() {}
+
+        // Restore bootloader information
+        if erase_uicr {
+            uicr.set_bootloader_infos(bootloader_infos);
+        }
 
         let mut needs_soft_reset: bool = false;
 
@@ -91,6 +98,9 @@ impl Component for NrfStartupComponent {
         if needs_soft_reset {
             cortexm4::scb::reset();
         }
+
+        // Ensure that we're back to read-only
+        nrf52::nvmc::NVMC.configure_read_only();
     }
 }
 
