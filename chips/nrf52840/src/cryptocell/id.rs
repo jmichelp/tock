@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cryptocell::bitfields::*;
+use crate::cryptocell::bitfields::{
+    ComponentId0, ComponentId1, ComponentId2, ComponentId3, PeripheralId0, PeripheralId1,
+    PeripheralId2, PeripheralId3, PeripheralId4,
+};
 use kernel::common::registers::{register_structs, ReadOnly};
 
 register_structs! {

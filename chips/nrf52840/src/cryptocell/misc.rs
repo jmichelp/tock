@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cryptocell::bitfields::*;
+use crate::cryptocell::bitfields::{ClockStatus, Task};
 use kernel::common::registers::{register_structs, ReadOnly, ReadWrite};
 
 register_structs! {

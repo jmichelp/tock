@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::bitfields::*;
+use super::bitfields::{
+    Event, MemoryMap, MonitorSelect, NNpT0T1, OpSize, Opcode, PkaAddress, PkaStatus, Task,
+};
 use kernel::common::registers::{register_structs, ReadOnly, ReadWrite, WriteOnly};
 
 register_structs! {

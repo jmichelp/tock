@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cryptocell::bitfields::*;
+use crate::cryptocell::bitfields::{
+    Bool, BootFlags, CryptoCellIdle, CryptoKey, Interrupts, IotLcs, RgfEndianness, Task,
+};
 use kernel::common::registers::{register_structs, ReadOnly, ReadWrite, WriteOnly};
 
 register_structs! {

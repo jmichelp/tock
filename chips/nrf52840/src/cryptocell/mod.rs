@@ -22,10 +22,12 @@
 
 use core::cell::Cell;
 use kernel::common::cells::{OptionalCell, TakeCell};
+use kernel::common::leasable_buffer::LeasableBuffer;
 use kernel::common::registers::{register_structs, InMemoryRegister, ReadWrite};
 use kernel::common::StaticRef;
 use kernel::debug;
 use kernel::hil;
+use kernel::hil::time;
 
 mod aes;
 mod ahb;
@@ -137,7 +139,7 @@ pub struct CryptoCell310<'a> {
     power: StaticRef<NordicCC310Registers>,
     usage_count: Cell<usize>,
     current_op: Cell<OperationMode>,
-
+    //alarm: time::Alarm,
     aes_client: OptionalCell<&'a dyn hil::symmetric_encryption::Client<'a>>,
     trng_client: OptionalCell<&'a dyn hil::entropy::Client32>,
     sha256_client: OptionalCell<&'a dyn hil::digest::Client<'a, [u8; 32]>>,
@@ -151,7 +153,7 @@ pub struct CryptoCell310<'a> {
     hash_hmac_opad_ctx: Cell<[u32; 8]>,
     hash_total_size: Cell<u64>,
     hash_data_queue: Cell<[u8; 64]>,
-    //hash_data_buff: Cell<Option<LeasableBuffer<'static u8>>>,
+    hash_data_buff: Cell<Option<LeasableBuffer<'static, u8>>>,
     hash_digest: Cell<Option<&'static mut [u8; 32]>>,
 }
 
@@ -188,14 +190,14 @@ impl<'a> CryptoCell310<'a> {
             hash_hmac_opad_ctx: Cell::new([0; 8]),
             hash_total_size: Cell::new(0),
             hash_data_queue: Cell::new([0; 64]),
-            //hash_data_buff: Cell::new(None),
+            hash_data_buff: Cell::new(None),
             hash_digest: Cell::new(None),
         }
     }
 
     pub fn enable(&self) {
         if self.usage_count.get() == 0 {
-            debug!("[CC310] Starting CRYPTOCELL...");
+            //debug!("[CC310] Starting CRYPTOCELL...");
             self.power.enable.write(bitfields::Task::ENABLE::SET);
             if self.registers.ctrl.undocumented.get() >> 24 != 0xf0 {
                 debug!(
@@ -241,7 +243,7 @@ impl<'a> CryptoCell310<'a> {
         if self.usage_count.get() == 0 {
             return;
         }
-        debug!("[CC310] Switching off CRYPTOCELL");
+        //debug!("[CC310] Switching off CRYPTOCELL");
         self.usage_count.set(self.usage_count.get() - 1);
         if self.usage_count.get() == 0 {
             self.registers.host_rgf.interrupt_mask.set(0);
@@ -276,33 +278,33 @@ impl<'a> CryptoCell310<'a> {
 
         // A block of data has been fully acquired by the CryptoCell
         if intrs.is_set(bitfields::Interrupts::MEM_TO_DIN) {
-            debug!("[CC310] SRAM_TO_DIN interrupt");
+            debug!("[CC310] MEM_TO_DIN interrupt");
             regs.interrupt_clear
                 .write(bitfields::Interrupts::MEM_TO_DIN::SET);
         }
 
         // A result data has been fully copied to the chip memory
         if intrs.is_set(bitfields::Interrupts::DOUT_TO_MEM) {
-            debug!("[CC310] SRAM_TO_DIN interrupt");
+            debug!("[CC310] DOUT_TO_MEM interrupt");
             regs.interrupt_clear
                 .write(bitfields::Interrupts::DOUT_TO_MEM::SET);
         }
 
         if intrs.is_set(bitfields::Interrupts::AXI_ERROR) {
-            debug!("[CC310] SRAM_TO_DIN interrupt");
+            debug!("[CC310] AXI_ERROR interrupt");
             regs.interrupt_clear
                 .write(bitfields::Interrupts::AXI_ERROR::SET);
         }
 
         // An operationg in the PKA module is finished.
         if intrs.is_set(bitfields::Interrupts::PKA_EXP) {
-            debug!("[CC310] SRAM_TO_DIN interrupt");
+            debug!("[CC310] PKA_EXP interrupt");
             regs.interrupt_clear
                 .write(bitfields::Interrupts::PKA_EXP::SET);
         }
 
         if intrs.is_set(bitfields::Interrupts::RNG) {
-            debug!("[CC310] SRAM_TO_DIN interrupt");
+            debug!("[CC310] RNG interrupt");
             /*regs.interrupt_mask.modify(bitfields::Interrupts::RNG::SET);
             let rng_isr = &self.registers.rng.isr.extract();
             regs.rng.icr.set(0xffffffff);
@@ -323,7 +325,7 @@ impl<'a> CryptoCell310<'a> {
         }
 
         if intrs.is_set(bitfields::Interrupts::SYM_DMA_COMPLETED) {
-            debug!("[CC310] SRAM_TO_DIN interrupt");
+            debug!("[CC310] SYM_DMA_COMPLETED interrupt");
             regs.interrupt_clear
                 .write(bitfields::Interrupts::SYM_DMA_COMPLETED::SET);
         }
@@ -331,6 +333,136 @@ impl<'a> CryptoCell310<'a> {
 
     fn get_trng_rand32(&self) -> Option<u32> {
         None
+    }
+
+    fn cc_hash_update(&self, data: &[u8], is_last_block: bool) {
+        let mut digest = self.hash_ctx.get();
+        // Start CryptoCell
+        self.enable();
+        // TODO(jmichel): move this to async
+        while self.registers.ctrl.hash_busy.is_set(bitfields::Busy::BUSY) {}
+        while self
+            .registers
+            .ctrl
+            .crypto_busy
+            .is_set(bitfields::Busy::BUSY)
+        {}
+        while self
+            .registers
+            .din
+            .mem_dma_busy
+            .is_set(bitfields::Busy::BUSY)
+        {}
+
+        // Start HASH module and configure it
+        self.current_op.set(OperationMode::Hash);
+        self.registers
+            .misc
+            .hash_clk_enable
+            .write(bitfields::Task::ENABLE::SET);
+        self.registers
+            .ctrl
+            .crypto_ctl
+            .write(bitfields::CryptoMode::MODE::Hash);
+        self.registers
+            .hash
+            .padding
+            .write(bitfields::Task::ENABLE::SET);
+        let size = self.hash_total_size.get();
+        self.registers.hash.hash_len_lsb.set(size as u32);
+        self.registers
+            .hash
+            .hash_len_msb
+            .set(size.wrapping_shr(32) as u32);
+        self.registers.hash.control.set(match self.hash_algo.get() {
+            HashMode::Digest(alg) | HashMode::Hmac(alg) => alg as u32,
+            _ => 2, // By default, pick SHA256
+        });
+
+        // Digest must be set backwards because writing to HASH[0]
+        // starts computation
+        for i in (0..digest.len()).rev() {
+            self.registers.hash.hash[i].set(digest[i]);
+        }
+        while self.registers.ctrl.hash_busy.is_set(bitfields::Busy::BUSY) {}
+
+        // Process data
+        if data.len() > 0 {
+            if is_last_block {
+                self.registers
+                    .hash
+                    .auto_hw_padding
+                    .write(bitfields::Task::ENABLE::SET);
+            }
+            self.registers.din.src_lli_word0.set(data.as_ptr() as u32);
+            self.registers
+                .din
+                .src_lli_word1
+                .write(bitfields::LliWord1::BYTES_NUM.val(data.len() as u32));
+            while !self
+                .registers
+                .host_rgf
+                .interrupts
+                .is_set(bitfields::Interrupts::MEM_TO_DIN)
+            {}
+            self.registers
+                .host_rgf
+                .interrupt_clear
+                .write(bitfields::Interrupts::MEM_TO_DIN::SET);
+        } else {
+            // use DO_PAD to complete padding of previous operation
+            self.registers
+                .hash
+                .pad_config
+                .write(hash::PaddingConfig::DO_PAD::SET);
+        }
+        while self
+            .registers
+            .ctrl
+            .crypto_busy
+            .is_set(bitfields::Busy::BUSY)
+        {}
+        while self
+            .registers
+            .din
+            .mem_dma_busy
+            .is_set(bitfields::Busy::BUSY)
+        {}
+
+        // Update context and total size
+        for i in (0..digest.len()).rev() {
+            digest[i] = self.registers.hash.hash[i].get();
+        }
+        self.hash_ctx.set(digest);
+        let new_size: u64 = ((self.registers.hash.hash_len_msb.get() as u64) << 32)
+            + (self.registers.hash.hash_len_lsb.get() as u64);
+        self.hash_total_size.set(new_size);
+
+        // Disable HASH module
+        self.registers
+            .hash
+            .padding
+            .write(bitfields::Task::ENABLE::SET);
+        self.registers
+            .hash
+            .auto_hw_padding
+            .write(bitfields::Task::ENABLE::CLEAR);
+        self.registers
+            .hash
+            .pad_config
+            .write(hash::PaddingConfig::DO_PAD::CLEAR);
+        while self
+            .registers
+            .ctrl
+            .crypto_busy
+            .is_set(bitfields::Busy::BUSY)
+        {}
+        self.registers
+            .misc
+            .hash_clk_enable
+            .write(bitfields::Task::ENABLE::CLEAR);
+
+        self.disable();
     }
 }
 

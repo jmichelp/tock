@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cryptocell::bitfields::*;
+use crate::cryptocell::bitfields::{Bool, Task};
 use crate::cryptocell::{CryptoCell310, DigestAlgorithm, HashMode};
 use core::cmp;
 use kernel::common::leasable_buffer::LeasableBuffer;
@@ -248,31 +248,47 @@ impl<'a> hil::digest::Digest<'a, [u8; 32]> for CryptoCell310<'a> {
         self.hash_data_buff.set(Some(data));
 
         // Merge queued data and new buffer
-        let data_slice = data.take();
+        let data_slice = self.hash_data_buff.take().unwrap().take();
         let slice_len = data_slice.len();
         debug!("[CC310] SHA256.add_data([u8; {}])", slice_len);
         let mut block = self.hash_data_queue.get();
         let mut processed_size = self.hash_total_size.get();
         let cursor_in_block = (processed_size % (block.len() as u64)) as usize;
         let left_in_block = block.len() - cursor_in_block;
+        debug!(
+            "[CC310] Already processed={}, slice.len={}, cursor={}, left_in_block={}",
+            processed_size, slice_len, cursor_in_block, left_in_block
+        );
 
         processed_size += slice_len as u64;
         self.hash_total_size.set(processed_size);
         if slice_len < left_in_block {
+            debug!("[CC310] less than a block. Buffering internally.");
             block[cursor_in_block..(cursor_in_block + slice_len)].copy_from_slice(data_slice);
         } else {
             // Process current block
             let (this_block, rest) = data_slice.split_at(left_in_block);
             block[cursor_in_block..].copy_from_slice(this_block);
+            let to_be_processed = data_slice.len() - left_in_block;
+            debug!("[CC310] Processing first full block...");
             self.cc_hash_update(&block, false);
             let end_offset = rest.len() - (rest.len() % block.len());
             let (full_blocks, tail) = rest.split_at(end_offset);
-            self.cc_hash_update(&full_blocks, false);
-            block[..tail.len()].copy_from_slice(tail);
+            if full_blocks.len() > 0 {
+                debug!(
+                    "[CC310] Processing other {} full blocks...",
+                    full_blocks.len()
+                );
+                self.cc_hash_update(&full_blocks, false);
+            }
+            if tail.len() > 0 {
+                debug!("[CC310] Buffering remaining data: {} bytes", tail.len());
+                block[..tail.len()].copy_from_slice(tail);
+            }
         }
-        self.sha256_client.map(move |client| {
+        /*self.sha256_client.map(move |client| {
             client.add_data_done(Ok(()), data_slice);
-        });
+        });*/
         Ok(slice_len)
     }
 
@@ -309,6 +325,7 @@ impl<'a> hil::digest::Digest<'a, [u8; 32]> for CryptoCell310<'a> {
             _ => {}
         };
         // TODO(jmichel): remove this
+        debug!("[CC310] HMAC value: {:?}", digest);
         self.hash_digest.set(Some(digest));
         debug!("[CC310] Triggering callback");
         self.sha256_client.map(|client| {
